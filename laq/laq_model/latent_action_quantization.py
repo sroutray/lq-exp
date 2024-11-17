@@ -4,7 +4,7 @@ import math
 import torch
 import torch.nn.functional as F
 from torch import nn
-from einops import rearrange, pack
+from einops import rearrange, pack, repeat
 from einops.layers.torch import Rearrange
 
 from laq_model.attention import Transformer, ContinuousPositionBias
@@ -282,7 +282,7 @@ class LatentActionQuantization(nn.Module):
         else:
             recon_loss = F.mse_loss(video, recon_video)
 
-        return recon_loss, num_unique_indices
+        return recon_loss, num_unique_indices, perplexity
         
 
     def inference(

@@ -18,10 +18,11 @@ from laq_model.optimizer import get_optimizer
 from ema_pytorch import EMA
 
 
-from laq_model.data import ImageVideoDataset
+from laq_model.data import VideoDataset
 
 
 from accelerate import Accelerator, DistributedDataParallelKwargs
+from accelerate.utils import DistributedType
 
 from einops import rearrange
 
@@ -72,12 +73,27 @@ class LAQTrainer(nn.Module):
         accelerate_kwargs: dict = dict(),
         weights = None,
         offsets = None,
+        wandb_mode = 'disabled',
     ):
         super().__init__()
         image_size = vae.image_size
 
+        # wandb config
+        self.wandb_mode = wandb_mode
+        config = {}
+        arguments = locals()
+        for key in arguments.keys():
+            if key not in ['self', 'config', '__class__', 'vae']:
+                config[key] = arguments[key]
+        
         ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters = True)
         self.accelerator = Accelerator(**accelerate_kwargs, kwargs_handlers=[ddp_kwargs])
+
+        
+        self.accelerator.init_trackers(project_name="CViViT", config=config, init_kwargs={"wandb": {"mode": self.wandb_mode, "name": results_folder.split('/')[-1], "config": config}})
+        if self.accelerator.is_main_process:
+            print('Config:\n')
+            print(config) 
 
         self.vae = vae
         self.results_folder_str = results_folder
@@ -116,9 +132,9 @@ class LAQTrainer(nn.Module):
         
         
         # sthv2 training
-        self.ds = ImageVideoDataset(folder, image_size, offset=offsets)
+        self.ds = VideoDataset(folder, image_size, mode="trainval", offset=offsets)
 
-        self.valid_ds = self.ds
+        self.valid_ds = VideoDataset(folder, image_size, mode="val", offset=offsets)
 
 
         self.dl = DataLoader(
@@ -243,7 +259,7 @@ class LAQTrainer(nn.Module):
             img = img.to(device)
 
             # with self.accelerator.autocast():
-            loss, num_unique_indices = self.vae(
+            loss, num_unique_indices, perplexity = self.vae(
                 img,
                 step=steps,
             )
@@ -252,6 +268,7 @@ class LAQTrainer(nn.Module):
 
             accum_log(logs, {'loss': loss.item() / self.grad_accum_every})
             accum_log(logs, {'num_unique_indices': num_unique_indices})
+            accum_log(logs, {'perplexity': perplexity / self.grad_accum_every})
 
         if exists(self.max_grad_norm):
             self.accelerator.clip_grad_norm_(self.vae.parameters(), self.max_grad_norm)
@@ -259,8 +276,8 @@ class LAQTrainer(nn.Module):
         self.optim.step()
         self.optim.zero_grad()
 
-        if self.is_main:  # Ensure only the main process logs in a distributed setting
-            wandb.log(logs)
+        # if self.is_main:  # Ensure only the main process logs in a distributed setting
+        #     wandb.log(logs)
 
         if self.is_main and self.use_ema:
             self.ema_vae.update()
@@ -302,7 +319,7 @@ class LAQTrainer(nn.Module):
                     imgs_and_recons = imgs_and_recons.detach().cpu().float().clamp(0., 1.)
                     grid = make_grid(imgs_and_recons, nrow = 3, normalize = True, value_range = (0, 1))
 
-                    logs['reconstructions'] = grid
+                    # logs['reconstructions'] = grid
 
                     save_image(grid, str(self.results_folder / f'{filename}.png'))
 
@@ -329,17 +346,19 @@ class LAQTrainer(nn.Module):
 
     def train(self, log_fn = noop):
         device = next(self.vae.parameters()).device
-        if self.accelerator.is_main_process:
-            wandb.init(project='phenaki_cnn',name=self.results_folder_str.split('/')[-1], config={
-                "learning_rate": self.lr,
-                "batch_size": self.batch_size,
-                "num_train_steps": self.num_train_steps,
-            })
+        # NOTE: Logging through accelerate
+        # if self.accelerator.is_main_process:
+        #     wandb.init(project='phenaki_cnn',name=self.results_folder_str.split('/')[-1], config={
+        #         "learning_rate": self.lr,
+        #         "batch_size": self.batch_size,
+        #         "num_train_steps": self.num_train_steps,
+        #     })
 
         while self.steps < self.num_train_steps:
             logs = self.train_step()
-            log_fn(logs)
+            self.accelerator.log(logs)
+            # log_fn(logs)
 
         self.print('training complete')
-        if self.accelerator.is_main_process:
-            wandb.finish()  
+        # if self.accelerator.is_main_process:
+        #     wandb.finish()  
